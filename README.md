@@ -94,7 +94,7 @@ of libc socket calls. It tracks every socket like the original `TSocketManager`
 
 | Windows original | This port |
 |---|---|
-| `MyWSASendTo`: first send on a UDP socket of a **74-byte** packet → send optional `drover-packet.bin`, a `0x00` byte, a `0x01` byte, `Sleep(50)`, then the real packet | `sendto()` hook, byte-for-byte identical sequence |
+| `MyWSASendTo`: first send on a UDP socket of a **74-byte** packet → send optional `drover-packet.bin`, a `0x00` byte, a `0x01` byte, `Sleep(50)`, then the real packet | `sendto()` **and `sendmsg()`** hooks (Linux Discord sends the voice handshake through `sendmsg` with iovecs — verified on Discord 1.0.160 where hooking `sendto` alone never fires) |
 | `MyWSASend` + `AddHttpProxyAuthorizationHeader`: Basic proxy auth injected over the `User-Agent` header line, padded to the same length so request framing is untouched | `send()`/`write()` hooks, same length-preserving injection |
 | `MySend` + `ConvertHttpToSocks5`: eats Discord's HTTP `CONNECT`, performs a real SOCKS5 handshake instead | `send()`/`write()` hooks, same inline handshake |
 | `MyRecv`: fakes `HTTP/1.1 200 Connection Established` after the SOCKS5 reply | `recv()` hook, same behavior (including the upstream caveat that real server data may mix with the SOCKS5 response) |
