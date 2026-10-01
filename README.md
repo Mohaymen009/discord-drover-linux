@@ -138,7 +138,7 @@ to disable. You can also point the shim at a custom path with the
 ```bash
 ./install.sh status
 # is the shim inside the running Discord?
-grep drover /proc/$(pgrep -f 'app-[0-9]*/Discord' | head -1)/maps
+grep drover /proc/$(pgrep -f '/Discord' | head -1)/maps
 # debug output on a manual launch:
 DROVER_DEBUG=1 LD_PRELOAD=~/.local/lib/libdrover.so discord
 ```

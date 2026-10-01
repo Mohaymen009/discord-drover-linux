@@ -123,7 +123,7 @@ do_install() {
     echo
     info "done. Fully quit Discord (tray icon -> Quit) and start it again."
     [[ -n "$PROXY" ]] && info "TCP goes through $PROXY; UDP voice manipulation is always active."
-    info "verify:  grep drover /proc/\$(pgrep -f 'app-[0-9]*/Discord' | head -1)/maps"
+    info "verify:  grep drover /proc/\$(pgrep -f '/Discord' | head -1)/maps"
 }
 
 do_uninstall() {
@@ -146,7 +146,7 @@ do_status() {
     echo "packet:   $([[ -f $PACKET ]] && echo enabled || echo disabled) ($PACKET)"
     echo "launcher: $([[ -f $DESKTOP_OVERRIDE ]] && grep -h '^Exec=' $DESKTOP_OVERRIDE || echo MISSING)"
     local pid
-    pid="$(pgrep -f 'app-[0-9]*/Discord' | head -1 || true)"
+    pid="$(pgrep -f '/Discord' | head -1 || true)"
     if [[ -n "$pid" ]]; then
         if grep -q drover "/proc/$pid/maps" 2>/dev/null; then
             echo "running Discord (pid $pid): shim LOADED"
