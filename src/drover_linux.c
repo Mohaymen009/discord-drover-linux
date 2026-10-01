@@ -81,12 +81,14 @@ typedef ssize_t (*send_fn)(int, const void *, size_t, int);
 typedef ssize_t (*recv_fn)(int, void *, size_t, int);
 typedef ssize_t (*sendto_fn)(int, const void *, size_t, int,
                              const struct sockaddr *, socklen_t);
+typedef ssize_t (*sendmsg_fn)(int, const struct msghdr *, int);
 typedef ssize_t (*write_fn)(int, const void *, size_t);
 typedef int (*close_fn)(int);
 
 static send_fn real_send;
 static recv_fn real_recv;
 static sendto_fn real_sendto;
+static sendmsg_fn real_sendmsg;
 static write_fn real_write;
 static close_fn real_close;
 
@@ -331,6 +333,19 @@ static ssize_t read_packet_file(unsigned char *out, size_t out_cap)
 #define GC_AGE_SECONDS 30
 #define DISCORD_HANDSHAKE_LEN 74
 
+/* handshake packet size to trigger the injection; DROVER_LEN overrides
+ * (Linux Discord builds may use a different STUN size than Windows) */
+static int trigger_len(void)
+{
+    static int cached = -2;
+    if (cached == -2) {
+        const char *e = getenv("DROVER_LEN");
+        int v = (e && *e) ? atoi(e) : DISCORD_HANDSHAKE_LEN;
+        cached = (v > 0) ? v : DISCORD_HANDSHAKE_LEN;
+    }
+    return cached;
+}
+
 enum { SOCK_KIND_OTHER = 0, SOCK_KIND_TCP, SOCK_KIND_UDP };
 
 struct entry {
@@ -520,7 +535,30 @@ static void inject_before_handshake(int fd, const struct sockaddr *dest,
         struct timespec ts = {0, 50 * 1000 * 1000}; /* Sleep(50) */
         nanosleep(&ts, NULL);
     }
-    drover_log("injected Direct-mode probes before 74-byte handshake");
+    drover_log("injected Direct-mode probes before %d-byte handshake",
+               trigger_len());
+}
+
+static void format_dest(const struct sockaddr *sa, socklen_t salen,
+                        char *out, size_t out_cap)
+{
+    if (!sa || salen < sizeof(sa->sa_family)) {
+        snprintf(out, out_cap, "%s", "(connected)");
+        return;
+    }
+    if (sa->sa_family == AF_INET) {
+        char ip[INET_ADDRSTRLEN] = "?";
+        const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+        inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+        snprintf(out, out_cap, "%s:%d", ip, ntohs(a->sin_port));
+    } else if (sa->sa_family == AF_INET6) {
+        char ip[INET6_ADDRSTRLEN] = "?";
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+        inet_ntop(AF_INET6, &a->sin6_addr, ip, sizeof(ip));
+        snprintf(out, out_cap, "[%s]:%d", ip, ntohs(a->sin6_port));
+    } else {
+        snprintf(out, out_cap, "(family %d)", (int)sa->sa_family);
+    }
 }
 
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
@@ -529,13 +567,58 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     int kind = SOCK_KIND_OTHER;
 
     HOOK_ENTER();
-    if (consume_first_send(sockfd, &kind) && kind == SOCK_KIND_UDP &&
-        len == DISCORD_HANDSHAKE_LEN)
-        inject_before_handshake(sockfd, dest_addr, addrlen);
+    if (consume_first_send(sockfd, &kind)) {
+        if (kind == SOCK_KIND_UDP) {
+            char dest[80];
+            format_dest(dest_addr, addrlen, dest, sizeof(dest));
+            drover_log("first UDP send via sendto: %zu bytes -> %s (trigger %d)",
+                       len, dest, trigger_len());
+            if (len == (size_t)trigger_len())
+                inject_before_handshake(sockfd, dest_addr, addrlen);
+        } else if (kind == SOCK_KIND_TCP) {
+            drover_log("first send via sendto: TCP, %zu bytes", len);
+        }
+    }
     HOOK_LEAVE();
 
 passthrough:
     return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+}
+
+/* Linux equivalent of WSASendTo's overlapped path: Chromium/libwebrtc may
+ * use sendmsg() with iovecs for the voice handshake */
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)
+{
+    int kind = SOCK_KIND_OTHER;
+
+    HOOK_ENTER();
+    {
+        size_t total = 0, i;
+        if (msg && msg->msg_iov)
+            for (i = 0; i < (size_t)msg->msg_iovlen; i++)
+                total += msg->msg_iov[i].iov_len;
+        if (consume_first_send(sockfd, &kind)) {
+            if (kind == SOCK_KIND_UDP) {
+                char dest[80];
+                format_dest(msg ? (const struct sockaddr *)msg->msg_name : NULL,
+                            msg ? msg->msg_namelen : 0, dest, sizeof(dest));
+                drover_log("first UDP send via sendmsg: %zu bytes in %d iov -> %s (trigger %d)",
+                           total, msg ? (int)msg->msg_iovlen : 0, dest,
+                           trigger_len());
+                if (total == (size_t)trigger_len()) {
+                    inject_before_handshake(sockfd,
+                                            msg ? (const struct sockaddr *)msg->msg_name : NULL,
+                                            msg ? msg->msg_namelen : 0);
+                }
+            } else if (kind == SOCK_KIND_TCP) {
+                drover_log("first send via sendmsg: TCP, %zu bytes", total);
+            }
+        }
+    }
+    HOOK_LEAVE();
+
+passthrough:
+    return real_sendmsg(sockfd, msg, flags);
 }
 
 /* ------------------------------------------------------------------ */
@@ -687,16 +770,13 @@ static int convert_http_to_socks5(int fd, const char *buf, size_t len,
 /* send()/write(): TCP proxy handling on first send                   */
 /* ------------------------------------------------------------------ */
 
+/* TCP proxy handling; the caller has already confirmed this is the
+ * confirmed-first send on a TCP socket */
 static ssize_t tcp_first_send_hook(int fd, const void *buf, size_t len,
-                                   int is_write, int flags)
+                                   int flags)
 {
-    int kind = SOCK_KIND_OTHER;
-
     if (len == 0)
         return -2; /* nothing to decide on */
-
-    if (!consume_first_send(fd, &kind) || kind != SOCK_KIND_TCP)
-        return -2;
 
     /* ConvertHttpToSocks5 (takes priority, exactly like MySend) */
     if (g_proxy.is_socks5 &&
@@ -718,19 +798,25 @@ static ssize_t tcp_first_send_hook(int fd, const void *buf, size_t len,
             }
         }
     }
-    (void)is_write;
+    (void)0;
     return -2;
 }
 
 ssize_t send(int fd, const void *buf, size_t len, int flags)
 {
-    ssize_t injected;
+    int kind = SOCK_KIND_OTHER;
+
     HOOK_ENTER();
-    if (g_proxy.specified) {
-        injected = tcp_first_send_hook(fd, buf, len, 0, flags);
-        if (injected != -2) {
-            HOOK_LEAVE();
-            return injected;
+    if (consume_first_send(fd, &kind)) {
+        if (kind == SOCK_KIND_UDP) {
+            drover_log("first UDP send via send: %zu bytes (trigger %d)", len,
+                       trigger_len());
+        } else if (kind == SOCK_KIND_TCP && g_proxy.specified) {
+            ssize_t injected = tcp_first_send_hook(fd, buf, len, flags);
+            if (injected != -2) {
+                HOOK_LEAVE();
+                return injected;
+            }
         }
     }
     HOOK_LEAVE();
@@ -740,13 +826,19 @@ passthrough:
 
 ssize_t write(int fd, const void *buf, size_t len)
 {
-    ssize_t injected;
+    int kind = SOCK_KIND_OTHER;
+
     HOOK_ENTER();
-    if (g_proxy.specified && fd >= 3 && len > 0) {
-        injected = tcp_first_send_hook(fd, buf, len, 1, 0);
-        if (injected != -2) {
-            HOOK_LEAVE();
-            return injected;
+    if (fd >= 3 && len > 0 && consume_first_send(fd, &kind)) {
+        if (kind == SOCK_KIND_UDP)
+            drover_log("first UDP send via write: %zu bytes (trigger %d)", len,
+                       trigger_len());
+        else if (kind == SOCK_KIND_TCP && g_proxy.specified) {
+            ssize_t injected = tcp_first_send_hook(fd, buf, len, 0);
+            if (injected != -2) {
+                HOOK_LEAVE();
+                return injected;
+            }
         }
     }
     HOOK_LEAVE();
@@ -811,6 +903,7 @@ static void resolve_all(void)
     RESOLVE(real_send, "send");
     RESOLVE(real_recv, "recv");
     RESOLVE(real_sendto, "sendto");
+    RESOLVE(real_sendmsg, "sendmsg");
     RESOLVE(real_write, "write");
     RESOLVE(real_close, "close");
 #undef RESOLVE
